@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 import yaml
 
+from coco_metrics import batch_to_coco_keypoint_results, evaluate_coco_keypoints
 from data import CocoKeypointsTopDownDataset
 from data.transforms import heatmap_pck
 from models import TiptVitPoseForPoseEstimation, weighted_heatmap_mse_loss
@@ -22,6 +25,31 @@ def get_heatmaps(outputs: Any) -> torch.Tensor:
     if isinstance(outputs, dict):
         return outputs["heatmaps"]
     return outputs.heatmaps
+
+
+def get_obfuscation_config(
+    cfg: dict[str, Any],
+    mode_override: str | None = None,
+    blur_kernel_size: int | None = None,
+    pixel_size: int | None = None,
+) -> dict[str, Any]:
+    data_cfg = cfg["data"]
+    value = data_cfg.get("val_obfuscation", data_cfg.get("obfuscation", {"mode": "none"}))
+    if value is None:
+        obfuscation = {"mode": "none"}
+    elif isinstance(value, str):
+        obfuscation = {"mode": value}
+    else:
+        obfuscation = deepcopy(value)
+
+    if mode_override is not None:
+        obfuscation["mode"] = mode_override
+        obfuscation["probability"] = 1.0
+    if blur_kernel_size is not None:
+        obfuscation["blur_kernel_size"] = blur_kernel_size
+    if pixel_size is not None:
+        obfuscation["pixel_size"] = pixel_size
+    return obfuscation
 
 
 def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
@@ -56,16 +84,43 @@ def resolve_device(value: str | None) -> torch.device:
     return torch.device(value)
 
 
+def save_metrics(path: str | Path, metrics: dict[str, float], cfg: dict[str, Any], obfuscation: dict[str, Any]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "metrics": metrics,
+                "obfuscation": obfuscation,
+                "config": cfg,
+            },
+            handle,
+            indent=2,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate TIPT-ViTPose with heatmap proxy metrics.")
     parser.add_argument("--config", default="configs/tipt_vitpose_hf_coco.yaml")
     parser.add_argument("--checkpoint")
+    parser.add_argument("--obfuscation", choices=["none", "blur", "pixelate", "random"])
+    parser.add_argument("--blur-kernel-size", type=int)
+    parser.add_argument("--pixel-size", type=int)
+    parser.add_argument("--no-coco", action="store_true")
+    parser.add_argument("--results-json", default="runs/eval_coco_keypoints.json")
+    parser.add_argument("--metrics-json")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = resolve_device(cfg.get("eval", {}).get("device", cfg.get("training", {}).get("device", "auto")))
     data_cfg = cfg["data"]
     eval_cfg = cfg.get("eval", {})
+    obfuscation = get_obfuscation_config(
+        cfg,
+        mode_override=args.obfuscation,
+        blur_kernel_size=args.blur_kernel_size,
+        pixel_size=args.pixel_size,
+    )
     dataset = CocoKeypointsTopDownDataset(
         image_root=data_cfg["val_image_dir"],
         annotation_file=data_cfg["val_annotations"],
@@ -75,6 +130,9 @@ def main() -> None:
         bbox_padding=float(data_cfg.get("bbox_padding", 1.25)),
         skip_empty=bool(data_cfg.get("skip_empty", True)),
         max_samples=data_cfg.get("val_max_samples"),
+        obfuscation=obfuscation,
+        deterministic_obfuscation=True,
+        obfuscation_seed=int(data_cfg.get("obfuscation_seed", 0)),
     )
     loader = DataLoader(
         dataset,
@@ -87,12 +145,13 @@ def main() -> None:
     model = make_model(cfg).to(device)
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(state["model"])
+        model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
     model.eval()
 
     total_loss = 0.0
     total_pck = 0.0
     batches = 0
+    coco_results: list[dict[str, Any]] = []
     with torch.no_grad():
         for batch in loader:
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
@@ -109,8 +168,24 @@ def main() -> None:
             total_loss += float(loss.cpu())
             total_pck += float(pck.cpu())
             batches += 1
+            if not args.no_coco:
+                coco_results.extend(
+                    batch_to_coco_keypoint_results(
+                        pred_heatmaps,
+                        batch,
+                        input_size=dataset.input_size,
+                    )
+                )
 
-    print(f"val_loss={total_loss / max(batches, 1):.6f} val_pck={total_pck / max(batches, 1):.4f}")
+    metrics = {"loss": total_loss / max(batches, 1), "pck": total_pck / max(batches, 1)}
+    if not args.no_coco:
+        metrics.update(evaluate_coco_keypoints(dataset.annotation_file, coco_results, output_path=args.results_json))
+
+    print(f"val_loss={metrics['loss']:.6f} val_pck={metrics['pck']:.4f}")
+    if not args.no_coco:
+        print(f"coco_AP={metrics['AP']:.4f} AP50={metrics['AP50']:.4f} AP75={metrics['AP75']:.4f}")
+    if args.metrics_json:
+        save_metrics(args.metrics_json, metrics, cfg, obfuscation)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import random
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 
 try:
     BILINEAR = Image.Resampling.BILINEAR
+    NEAREST = Image.Resampling.NEAREST
 except AttributeError:
     BILINEAR = Image.BILINEAR
+    NEAREST = Image.NEAREST
 
 
 def to_hw(size: int | Sequence[int]) -> tuple[int, int]:
@@ -49,6 +52,91 @@ def crop_and_resize(image: Image.Image, crop_xywh: Sequence[float], output_size:
     crop = image.crop((x, y, x + width, y + height))
     out_h, out_w = output_size
     return crop.resize((out_w, out_h), BILINEAR)
+
+
+def _sample_range(value: float | int | Sequence[float | int], rng: random.Random) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if len(value) != 2:
+        raise ValueError(f"Expected scalar or [min, max], got {value!r}")
+    lo, hi = float(value[0]), float(value[1])
+    return rng.uniform(lo, hi)
+
+
+def _sample_int_range(value: int | Sequence[int], rng: random.Random) -> int:
+    if isinstance(value, int):
+        return value
+    if len(value) != 2:
+        raise ValueError(f"Expected scalar or [min, max], got {value!r}")
+    lo, hi = int(value[0]), int(value[1])
+    return rng.randint(lo, hi)
+
+
+def _sample_odd_int_range(value: int | Sequence[int], rng: random.Random) -> int:
+    if isinstance(value, int):
+        return value
+    if len(value) != 2:
+        raise ValueError(f"Expected scalar or [min, max], got {value!r}")
+    lo, hi = int(value[0]), int(value[1])
+    if lo > hi:
+        raise ValueError(f"Invalid range [{lo}, {hi}]")
+    if lo % 2 == 0:
+        lo += 1
+    if hi % 2 == 0:
+        hi -= 1
+    if lo > hi:
+        raise ValueError(f"Range {value!r} contains no odd kernel size")
+    return rng.randrange(lo, hi + 1, 2)
+
+
+def blur_kernel_to_radius(kernel_size: int) -> float:
+    if kernel_size < 1:
+        raise ValueError(f"blur_kernel_size must be >= 1, got {kernel_size}")
+    if kernel_size % 2 == 0:
+        raise ValueError(f"blur_kernel_size must be odd, got {kernel_size}")
+    return (kernel_size - 1) / 6.0
+
+
+def apply_obfuscation(
+    image: Image.Image,
+    config: dict | None,
+    rng: random.Random | None = None,
+) -> Image.Image:
+    """Apply blur/pixelation online to a PIL crop without saving a second dataset."""
+
+    if not config:
+        return image
+
+    rng = rng or random
+    mode = config.get("mode", "none")
+    probability = float(config.get("probability", 1.0))
+    if mode in {None, "none"} or probability <= 0 or rng.random() > probability:
+        return image
+
+    if mode == "random":
+        modes = config.get("modes", ["none", "blur", "pixelate"])
+        if not modes:
+            return image
+        mode = rng.choice(list(modes))
+        if mode == "none":
+            return image
+
+    if mode == "blur":
+        if "blur_kernel_size" in config:
+            kernel_size = _sample_odd_int_range(config["blur_kernel_size"], rng)
+            radius = blur_kernel_to_radius(kernel_size)
+        else:
+            radius = _sample_range(config.get("blur_radius", 3.0), rng)
+        return image.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    if mode in {"pixelate", "pixelation"}:
+        pixel_size = _sample_int_range(config.get("pixel_size", config.get("pixelation_factor", 8)), rng)
+        pixel_size = max(1, pixel_size)
+        width, height = image.size
+        small_size = (max(1, width // pixel_size), max(1, height // pixel_size))
+        return image.resize(small_size, NEAREST).resize((width, height), NEAREST)
+
+    raise ValueError(f"Unsupported obfuscation mode {mode!r}; use none, blur, pixelate, or random.")
 
 
 def keypoints_to_crop(

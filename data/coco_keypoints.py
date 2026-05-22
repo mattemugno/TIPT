@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .transforms import (
+    apply_obfuscation,
     aspect_ratio_box,
     crop_and_resize,
     generate_keypoint_heatmaps,
@@ -55,6 +57,9 @@ class CocoKeypointsTopDownDataset(Dataset):
         image_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         skip_empty: bool = True,
         max_samples: int | None = None,
+        obfuscation: dict[str, Any] | None = None,
+        deterministic_obfuscation: bool = False,
+        obfuscation_seed: int = 0,
     ) -> None:
         self.image_root = Path(image_root)
         self.annotation_file = Path(annotation_file)
@@ -64,6 +69,9 @@ class CocoKeypointsTopDownDataset(Dataset):
         self.bbox_padding = bbox_padding
         self.image_mean = image_mean
         self.image_std = image_std
+        self.obfuscation = obfuscation or {"mode": "none"}
+        self.deterministic_obfuscation = deterministic_obfuscation
+        self.obfuscation_seed = obfuscation_seed
 
         with self.annotation_file.open("r", encoding="utf-8") as handle:
             coco: dict[str, Any] = json.load(handle)
@@ -94,6 +102,11 @@ class CocoKeypointsTopDownDataset(Dataset):
             image = image.convert("RGB")
             crop_box = aspect_ratio_box(ann["bbox"], self.input_size, padding=self.bbox_padding)
             crop = crop_and_resize(image, crop_box, self.input_size)
+            if self.deterministic_obfuscation:
+                rng = random.Random(self.obfuscation_seed + index)
+            else:
+                rng = random
+            crop = apply_obfuscation(crop, self.obfuscation, rng=rng)
 
         raw_keypoints = np.asarray(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
         keypoints_xy = keypoints_to_crop(raw_keypoints[:, :2], crop_box, self.input_size)

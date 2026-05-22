@@ -6,7 +6,7 @@ Questo progetto implementa la prima versione richiesta dalla specifica PDF:
 - stream strutturale Sobel -> patch embedding -> 4 Transformer block;
 - fusione shape-guided cross-attention con `alpha` iniziale a `0.1`;
 - dataset COCO2017 top-down con GT bbox, crop `256 x 192` e target heatmap gaussiane `64 x 48`;
-- loss MSE pesata dalla visibility mask, training loop, checkpoint e metrica proxy PCK.
+- loss MSE pesata dalla visibility mask, training loop, checkpoint, summary run e COCO keypoint AP.
 
 ## Setup
 
@@ -36,11 +36,54 @@ La configurazione di default fa warm-up congelando ViTPose per 2 epoch, poi sblo
 - nuovi moduli TIPT: `1e-4`;
 - pesi pretrained ViTPose: `1e-5`.
 
-## Valutazione Proxy
+Ogni run salva:
+
+- `runs/tipt_vitpose/<run_id>/latest.pt`
+- `runs/tipt_vitpose/<run_id>/best.pt`
+- `runs/tipt_vitpose/<run_id>/summary.json`
+- `runs/tipt_vitpose/<run_id>/coco_keypoints_val.json` se `training.final_coco_eval: true`
+- `runs/tipt_vitpose/latest_run.txt` con il path dell'ultima run
+
+## Valutazione COCO
 
 ```bash
-python eval_coco.py --config configs/tipt_vitpose_hf_coco.yaml --checkpoint runs/tipt_vitpose/best.pt
+RUN_DIR=$(cat runs/tipt_vitpose/latest_run.txt)
+python eval_coco.py --config configs/tipt_vitpose_hf_coco.yaml --checkpoint "$RUN_DIR/best.pt"
 ```
+
+Test senza creare dataset offuscati su disco:
+
+```bash
+python eval_coco.py \
+  --config configs/tipt_vitpose_hf_coco.yaml \
+  --checkpoint "$RUN_DIR/best.pt" \
+  --obfuscation blur \
+  --blur-kernel-size 11 \
+  --metrics-json "$RUN_DIR/eval_blur.json"
+
+python eval_coco.py \
+  --config configs/tipt_vitpose_hf_coco.yaml \
+  --checkpoint "$RUN_DIR/best.pt" \
+  --obfuscation pixelate \
+  --pixel-size 8 \
+  --metrics-json "$RUN_DIR/eval_pixelate.json"
+```
+
+Le metriche COCO sono calcolate in modalità top-down con GT bbox COCO, quindi confrontano il pose estimator senza includere un detector.
+
+Nei range `blur_kernel_size`, vengono campionati solo valori dispari. Per esempio `[3, 17]` produce `3, 5, 7, ..., 17`.
+
+## Controllo Visuale
+
+```bash
+python visualize_predictions.py \
+  --config configs/tipt_vitpose_hf_coco.yaml \
+  --checkpoint "$RUN_DIR/best.pt" \
+  --output-dir "$RUN_DIR/visuals" \
+  --num-samples 16
+```
+
+I PNG salvati mostrano predizioni in rosso e ground truth in verde sui crop persona del validation set.
 
 Per le ablation richieste, modifica `model.variant` e `model.fusion`:
 
