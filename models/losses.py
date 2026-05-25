@@ -41,3 +41,25 @@ def weighted_heatmap_mse_loss(
 
     weights = _broadcast_weights(target_weights, target_heatmaps)
     return ((pred_heatmaps - target_heatmaps).square() * weights).mean()
+
+
+def shape_invariance_loss(
+    shape_a: torch.Tensor,
+    shape_b: torch.Tensor,
+    mode: str = "cosine",
+) -> torch.Tensor:
+    """Encourage two obfuscated views of the same crop to share shape tokens."""
+
+    if shape_a.shape != shape_b.shape:
+        raise ValueError(f"Shape token tensors must match, got {tuple(shape_a.shape)} and {tuple(shape_b.shape)}")
+
+    if mode == "cosine":
+        norm_a = F.normalize(F.layer_norm(shape_a, shape_a.shape[-1:]), dim=-1)
+        norm_b = F.normalize(F.layer_norm(shape_b, shape_b.shape[-1:]), dim=-1)
+        return 1.0 - (norm_a * norm_b).sum(dim=-1).mean()
+    if mode == "mse":
+        norm_a = F.layer_norm(shape_a, shape_a.shape[-1:])
+        norm_b = F.layer_norm(shape_b, shape_b.shape[-1:])
+        return F.mse_loss(norm_a, norm_b)
+
+    raise ValueError(f"Unsupported shape invariance loss mode {mode!r}; use cosine or mse.")

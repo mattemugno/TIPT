@@ -1,0 +1,28 @@
+model:
+  checkpoint: usyd-community/vitpose-base-simple
+  variant: baseline
+  dataset_index:
+
+data:
+  train_image_dir: coco/train2017
+  val_image_dir: coco/val2017
+  train_annotations: coco/annotations/person_keypoints_train2017.json
+  val_annotations: coco/annotations/person_keypoints_val2017.json
+  input_size: [256, 192]
+  heatmap_size: [64, 48]
+  sigma: 2.0
+  bbox_padding: 1.25
+  skip_empty: true
+  train_max_samples:
+  val_max_samples:
+  obfuscation_seed: 0
+  val_obfuscation:
+    mode: none
+    blur_kernel_size: 11
+    pixel_size: 8
+
+eval:
+  device: auto
+  batch_size: 32
+  num_workers: 4
+  pck_threshold: 0.05

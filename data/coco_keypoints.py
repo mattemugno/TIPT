@@ -60,6 +60,7 @@ class CocoKeypointsTopDownDataset(Dataset):
         obfuscation: dict[str, Any] | None = None,
         deterministic_obfuscation: bool = False,
         obfuscation_seed: int = 0,
+        invariance_views: dict[str, Any] | None = None,
     ) -> None:
         self.image_root = Path(image_root)
         self.annotation_file = Path(annotation_file)
@@ -72,6 +73,7 @@ class CocoKeypointsTopDownDataset(Dataset):
         self.obfuscation = obfuscation or {"mode": "none"}
         self.deterministic_obfuscation = deterministic_obfuscation
         self.obfuscation_seed = obfuscation_seed
+        self.invariance_views = invariance_views or {"enabled": False}
 
         with self.annotation_file.open("r", encoding="utf-8") as handle:
             coco: dict[str, Any] = json.load(handle)
@@ -101,12 +103,12 @@ class CocoKeypointsTopDownDataset(Dataset):
         with Image.open(image_path) as image:
             image = image.convert("RGB")
             crop_box = aspect_ratio_box(ann["bbox"], self.input_size, padding=self.bbox_padding)
-            crop = crop_and_resize(image, crop_box, self.input_size)
+            base_crop = crop_and_resize(image, crop_box, self.input_size)
             if self.deterministic_obfuscation:
                 rng = random.Random(self.obfuscation_seed + index)
             else:
                 rng = random
-            crop = apply_obfuscation(crop, self.obfuscation, rng=rng)
+            crop = apply_obfuscation(base_crop.copy(), self.obfuscation, rng=rng)
 
         raw_keypoints = np.asarray(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
         keypoints_xy = keypoints_to_crop(raw_keypoints[:, :2], crop_box, self.input_size)
@@ -119,7 +121,7 @@ class CocoKeypointsTopDownDataset(Dataset):
             sigma=self.sigma,
         )
 
-        return {
+        sample = {
             "pixel_values": normalize_image(crop, self.image_mean, self.image_std),
             "target_heatmaps": target_heatmaps,
             "target_weights": target_weights,
@@ -130,3 +132,20 @@ class CocoKeypointsTopDownDataset(Dataset):
             "image_id": torch.tensor(int(ann["image_id"]), dtype=torch.long),
             "annotation_id": torch.tensor(int(ann["id"]), dtype=torch.long),
         }
+
+        if self.invariance_views.get("enabled", False):
+            view_a_cfg = self.invariance_views.get("view_a", {"mode": "blur", "blur_kernel_size": 11})
+            view_b_cfg = self.invariance_views.get("view_b", {"mode": "pixelate", "pixel_size": 8})
+            if self.deterministic_obfuscation:
+                rng_a = random.Random(self.obfuscation_seed + 100_000 + index)
+                rng_b = random.Random(self.obfuscation_seed + 200_000 + index)
+            else:
+                rng_a = random
+                rng_b = random
+
+            crop_a = apply_obfuscation(base_crop.copy(), view_a_cfg, rng=rng_a)
+            crop_b = apply_obfuscation(base_crop.copy(), view_b_cfg, rng=rng_b)
+            sample["pixel_values_view_a"] = normalize_image(crop_a, self.image_mean, self.image_std)
+            sample["pixel_values_view_b"] = normalize_image(crop_b, self.image_mean, self.image_std)
+
+        return sample

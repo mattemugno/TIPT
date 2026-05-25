@@ -1,12 +1,13 @@
 model:
   checkpoint: usyd-community/vitpose-base-simple
-  variant: baseline
-  #variant: tipt_cross_attention
-  fusion: cross_attention
-  structural_view: sobel
+  variant: tipt_v3
+  structural_channels: [sobel_x, sobel_y, magnitude]
+  stem_channels: 32
+  stem_depth: 3
   shape_depth: 4
   shape_dropout: 0.0
-  alpha_init: 0.1
+  gate_init: 0.1
+  gate_hidden_ratio: 0.25
   mlp_ratio: 4
   num_heads:
   dataset_index:
@@ -25,10 +26,17 @@ data:
   val_max_samples:
   obfuscation_seed: 0
   train_obfuscation:
-    mode: blur
-    blur_kernel_size: [3, 17]
-    probability: 0.7
+    mode: none
+    blur_kernel_size: 11
     pixel_size: 8
+  train_invariance_views:
+    enabled: true
+    view_a:
+      mode: blur
+      blur_kernel_size: [3, 17]
+    view_b:
+      mode: pixelate
+      pixel_size: [4, 12]
   val_obfuscation:
     mode: blur
     blur_kernel_size: 11
@@ -36,23 +44,27 @@ data:
 
 training:
   device: auto
-  output_dir: runs/tipt_vitpose
-  run_name:
+  output_dir: runs/tipt_vitpose_v3
+  run_name: tipt_v3_shape_invariance
   summary_file: summary.json
   final_coco_eval: true
   epochs: 5
   freeze_pretrained_epochs: 2
-  batch_size: 32
-  eval_batch_size: 32
+  batch_size: 16
+  eval_batch_size: 16
   num_workers: 4
   new_lr: 0.0001
   pretrained_lr: 0.00001
   weight_decay: 0.05
   grad_clip_norm: 1.0
   log_every: 25
+  invariance:
+    enabled: true
+    mode: cosine
+    weight: 0.05
 
 eval:
   device: auto
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   pck_threshold: 0.05

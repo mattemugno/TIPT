@@ -1,12 +1,13 @@
 model:
   checkpoint: usyd-community/vitpose-base-simple
-  variant: baseline
-  #variant: tipt_cross_attention
-  fusion: cross_attention
-  structural_view: sobel
+  variant: tipt_v2
+  structural_channels: [sobel_x, sobel_y, magnitude]
+  stem_channels: 32
+  stem_depth: 3
   shape_depth: 4
   shape_dropout: 0.0
-  alpha_init: 0.1
+  gate_init: 0.1
+  gate_hidden_ratio: 0.25
   mlp_ratio: 4
   num_heads:
   dataset_index:
@@ -25,10 +26,11 @@ data:
   val_max_samples:
   obfuscation_seed: 0
   train_obfuscation:
-    mode: blur
-    blur_kernel_size: [3, 17]
+    mode: random
+    modes: [none, blur, pixelate]
     probability: 0.7
-    pixel_size: 8
+    blur_kernel_size: [3, 17]
+    pixel_size: [4, 12]
   val_obfuscation:
     mode: blur
     blur_kernel_size: 11
@@ -36,8 +38,8 @@ data:
 
 training:
   device: auto
-  output_dir: runs/tipt_vitpose
-  run_name:
+  output_dir: runs/tipt_vitpose_v2
+  run_name: tipt_v2_shape_residual
   summary_file: summary.json
   final_coco_eval: true
   epochs: 5

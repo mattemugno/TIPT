@@ -13,7 +13,7 @@ import yaml
 from coco_metrics import batch_to_coco_keypoint_results, evaluate_coco_keypoints
 from data import CocoKeypointsTopDownDataset
 from data.transforms import heatmap_pck
-from models import TiptVitPoseForPoseEstimation, weighted_heatmap_mse_loss
+from models import TiptVitPoseForPoseEstimation, TiptVitPoseV2ForPoseEstimation, weighted_heatmap_mse_loss
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -59,6 +59,19 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
         from transformers import VitPoseForPoseEstimation
 
         return VitPoseForPoseEstimation.from_pretrained(checkpoint)
+    if model_cfg.get("variant") in {"tipt_v2", "tipt_v3", "tipt_shape_residual", "tipt_multilevel"}:
+        return TiptVitPoseV2ForPoseEstimation(
+            checkpoint=checkpoint,
+            structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
+            stem_channels=int(model_cfg.get("stem_channels", 32)),
+            stem_depth=int(model_cfg.get("stem_depth", 3)),
+            shape_depth=int(model_cfg.get("shape_depth", 4)),
+            shape_dropout=float(model_cfg.get("shape_dropout", 0.0)),
+            num_heads=model_cfg.get("num_heads"),
+            gate_init=float(model_cfg.get("gate_init", 0.1)),
+            gate_hidden_ratio=float(model_cfg.get("gate_hidden_ratio", 0.25)),
+            mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+        )
     return TiptVitPoseForPoseEstimation(
         checkpoint=checkpoint,
         shape_depth=int(model_cfg.get("shape_depth", 4)),
@@ -97,6 +110,32 @@ def save_metrics(path: str | Path, metrics: dict[str, float], cfg: dict[str, Any
             handle,
             indent=2,
         )
+
+
+def model_metadata(model: torch.nn.Module, checkpoint: str | None) -> dict[str, Any]:
+    config = getattr(model, "config", None)
+    if config is None and hasattr(model, "vitpose"):
+        config = getattr(model.vitpose, "config", None)
+
+    backbone_config = getattr(config, "backbone_config", None)
+    metadata = {
+        "model_class": model.__class__.__name__,
+        "checkpoint_arg": checkpoint,
+        "num_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "trainable_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+    }
+    if config is not None:
+        metadata["hf_model_type"] = getattr(config, "model_type", None)
+        metadata["use_simple_decoder"] = getattr(config, "use_simple_decoder", None)
+        metadata["scale_factor"] = getattr(config, "scale_factor", None)
+    if backbone_config is not None:
+        metadata["backbone_model_type"] = getattr(backbone_config, "model_type", None)
+        metadata["backbone_hidden_size"] = getattr(backbone_config, "hidden_size", None)
+        metadata["backbone_num_hidden_layers"] = getattr(backbone_config, "num_hidden_layers", None)
+        metadata["backbone_num_attention_heads"] = getattr(backbone_config, "num_attention_heads", None)
+        metadata["backbone_image_size"] = getattr(backbone_config, "image_size", None)
+        metadata["backbone_patch_size"] = getattr(backbone_config, "patch_size", None)
+    return metadata
 
 
 def main() -> None:
@@ -146,6 +185,8 @@ def main() -> None:
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
+    metadata = model_metadata(model, args.checkpoint)
+    print(f"model_metadata={json.dumps(metadata, sort_keys=True)}")
     model.eval()
 
     total_loss = 0.0
@@ -186,6 +227,11 @@ def main() -> None:
         print(f"coco_AP={metrics['AP']:.4f} AP50={metrics['AP50']:.4f} AP75={metrics['AP75']:.4f}")
     if args.metrics_json:
         save_metrics(args.metrics_json, metrics, cfg, obfuscation)
+        with Path(args.metrics_json).open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload["model_metadata"] = metadata
+        with Path(args.metrics_json).open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,12 @@ import yaml
 from coco_metrics import batch_to_coco_keypoint_results, evaluate_coco_keypoints
 from data import CocoKeypointsTopDownDataset
 from data.transforms import heatmap_pck
-from models import TiptVitPoseForPoseEstimation, weighted_heatmap_mse_loss
+from models import (
+    TiptVitPoseForPoseEstimation,
+    TiptVitPoseV2ForPoseEstimation,
+    shape_invariance_loss,
+    weighted_heatmap_mse_loss,
+)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -39,6 +44,14 @@ def get_obfuscation_config(cfg: dict[str, Any], split: str) -> dict[str, Any]:
     return deepcopy(value)
 
 
+def get_invariance_views_config(cfg: dict[str, Any], split: str) -> dict[str, Any]:
+    data_cfg = cfg["data"]
+    if split != "train":
+        return {"enabled": False}
+    value = data_cfg.get("train_invariance_views", {"enabled": False})
+    return deepcopy(value) if value is not None else {"enabled": False}
+
+
 def make_dataset(cfg: dict[str, Any], split: str) -> CocoKeypointsTopDownDataset:
     data_cfg = cfg["data"]
     prefix = "train" if split == "train" else "val"
@@ -54,6 +67,7 @@ def make_dataset(cfg: dict[str, Any], split: str) -> CocoKeypointsTopDownDataset
         obfuscation=get_obfuscation_config(cfg, prefix),
         deterministic_obfuscation=prefix != "train",
         obfuscation_seed=int(data_cfg.get("obfuscation_seed", 0)),
+        invariance_views=get_invariance_views_config(cfg, prefix),
     )
 
 
@@ -65,6 +79,20 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
         from transformers import VitPoseForPoseEstimation
 
         return VitPoseForPoseEstimation.from_pretrained(checkpoint)
+
+    if variant in {"tipt_v2", "tipt_v3", "tipt_shape_residual", "tipt_multilevel"}:
+        return TiptVitPoseV2ForPoseEstimation(
+            checkpoint=checkpoint,
+            structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
+            stem_channels=int(model_cfg.get("stem_channels", 32)),
+            stem_depth=int(model_cfg.get("stem_depth", 3)),
+            shape_depth=int(model_cfg.get("shape_depth", 4)),
+            shape_dropout=float(model_cfg.get("shape_dropout", 0.0)),
+            num_heads=model_cfg.get("num_heads"),
+            gate_init=float(model_cfg.get("gate_init", 0.1)),
+            gate_hidden_ratio=float(model_cfg.get("gate_hidden_ratio", 0.25)),
+            mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+        )
 
     return TiptVitPoseForPoseEstimation(
         checkpoint=checkpoint,
@@ -102,6 +130,16 @@ def maybe_dataset_index(batch_size: int, cfg: dict[str, Any], device: torch.devi
     if value is None:
         return None
     return torch.full((batch_size,), int(value), dtype=torch.long, device=device)
+
+
+def get_shape_tokens(outputs: Any) -> torch.Tensor:
+    if isinstance(outputs, dict):
+        shape_tokens = outputs.get("F_shape")
+    else:
+        shape_tokens = getattr(outputs, "F_shape", None)
+    if shape_tokens is None:
+        raise RuntimeError("Invariance training requires model outputs with F_shape.")
+    return shape_tokens
 
 
 def sanitize_run_name(value: str) -> str:
@@ -167,24 +205,58 @@ def run_epoch(
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
+    total_heatmap_loss = 0.0
+    total_invariance_loss = 0.0
     total_pck = 0.0
     total_batches = 0
     coco_results: list[dict[str, Any]] = []
     log_every = int(cfg.get("training", {}).get("log_every", 25))
+    invariance_cfg = cfg.get("training", {}).get("invariance", {})
+    invariance_weight = float(invariance_cfg.get("weight", 0.0)) if is_train and invariance_cfg.get("enabled", False) else 0.0
+    invariance_mode = str(invariance_cfg.get("mode", "cosine"))
 
     for step, batch in enumerate(loader, start=1):
-        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         target_heatmaps = batch["target_heatmaps"].to(device, non_blocking=True)
         target_weights = batch["target_weights"].to(device, non_blocking=True)
-        dataset_index = maybe_dataset_index(pixel_values.shape[0], cfg, device)
+        batch_size = target_heatmaps.shape[0]
+        dataset_index = maybe_dataset_index(batch_size, cfg, device)
+        use_invariance = (
+            invariance_weight > 0
+            and "pixel_values_view_a" in batch
+            and "pixel_values_view_b" in batch
+        )
 
         with torch.set_grad_enabled(is_train):
-            if dataset_index is None:
-                outputs = model(pixel_values=pixel_values)
+            if use_invariance:
+                pixel_values_a = batch["pixel_values_view_a"].to(device, non_blocking=True)
+                pixel_values_b = batch["pixel_values_view_b"].to(device, non_blocking=True)
+                if dataset_index is None:
+                    outputs_a = model(pixel_values=pixel_values_a)
+                    outputs_b = model(pixel_values=pixel_values_b)
+                else:
+                    outputs_a = model(pixel_values=pixel_values_a, dataset_index=dataset_index)
+                    outputs_b = model(pixel_values=pixel_values_b, dataset_index=dataset_index)
+
+                pred_heatmaps = get_heatmaps(outputs_a)
+                heatmap_loss_a = weighted_heatmap_mse_loss(pred_heatmaps, target_heatmaps, target_weights)
+                heatmap_loss_b = weighted_heatmap_mse_loss(get_heatmaps(outputs_b), target_heatmaps, target_weights)
+                heatmap_loss = 0.5 * (heatmap_loss_a + heatmap_loss_b)
+                inv_loss = shape_invariance_loss(
+                    get_shape_tokens(outputs_a),
+                    get_shape_tokens(outputs_b),
+                    mode=invariance_mode,
+                )
+                loss = heatmap_loss + invariance_weight * inv_loss
             else:
-                outputs = model(pixel_values=pixel_values, dataset_index=dataset_index)
-            pred_heatmaps = get_heatmaps(outputs)
-            loss = weighted_heatmap_mse_loss(pred_heatmaps, target_heatmaps, target_weights)
+                pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+                if dataset_index is None:
+                    outputs = model(pixel_values=pixel_values)
+                else:
+                    outputs = model(pixel_values=pixel_values, dataset_index=dataset_index)
+                pred_heatmaps = get_heatmaps(outputs)
+                heatmap_loss = weighted_heatmap_mse_loss(pred_heatmaps, target_heatmaps, target_weights)
+                inv_loss = pred_heatmaps.new_tensor(0.0)
+                loss = heatmap_loss
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -196,6 +268,8 @@ def run_epoch(
 
         pck = heatmap_pck(pred_heatmaps, target_heatmaps, target_weights, cfg.get("eval", {}).get("pck_threshold", 0.05))
         total_loss += float(loss.detach().cpu())
+        total_heatmap_loss += float(heatmap_loss.detach().cpu())
+        total_invariance_loss += float(inv_loss.detach().cpu())
         total_pck += float(pck.detach().cpu())
         total_batches += 1
         if coco_results_path is not None:
@@ -208,9 +282,19 @@ def run_epoch(
             )
 
         if is_train and step % log_every == 0:
-            print(f"epoch={epoch} step={step} loss={total_loss / total_batches:.6f} pck={total_pck / total_batches:.4f}")
+            print(
+                f"epoch={epoch} step={step} loss={total_loss / total_batches:.6f} "
+                f"heatmap_loss={total_heatmap_loss / total_batches:.6f} "
+                f"inv_loss={total_invariance_loss / total_batches:.6f} "
+                f"pck={total_pck / total_batches:.4f}"
+            )
 
-    metrics = {"loss": total_loss / max(total_batches, 1), "pck": total_pck / max(total_batches, 1)}
+    metrics = {
+        "loss": total_loss / max(total_batches, 1),
+        "heatmap_loss": total_heatmap_loss / max(total_batches, 1),
+        "invariance_loss": total_invariance_loss / max(total_batches, 1),
+        "pck": total_pck / max(total_batches, 1),
+    }
     if coco_results_path is not None:
         metrics.update(
             evaluate_coco_keypoints(

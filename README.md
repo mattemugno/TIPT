@@ -31,6 +31,29 @@ coco/
 python train.py --config configs/tipt_vitpose_hf_coco.yaml
 ```
 
+TIPT-v2 shape-first con canali strutturali, edge CNN stem, gate dinamico e fusion residua multi-livello:
+
+```bash
+python train.py --config configs/tipt_vitpose_v2_hf_coco.yaml
+```
+
+TIPT-v3 aggiunge training two-view e invarianza esplicita tra shape token blur/pixelation:
+
+```bash
+python train.py --config configs/tipt_vitpose_v3_hf_coco.yaml
+```
+
+Sweep blur baseline ViTPose-B vs TIPT-v3:
+
+```bash
+python scripts/eval_blur_sweep.py \
+  --baseline-config configs/vitpose_b_baseline_hf_coco.yaml \
+  --min-kernel 3 \
+  --max-kernel 17
+```
+
+Lo script salva metriche e predizioni in `runs/blur_sweeps/<timestamp>/`, più `summary.csv` e `summary.json`.
+
 La configurazione di default fa warm-up congelando ViTPose per 2 epoch, poi sblocca backbone/head mantenendo due learning rate group:
 
 - nuovi moduli TIPT: `1e-4`;
