@@ -17,7 +17,8 @@ from data import CocoKeypointsTopDownDataset
 from data.transforms import heatmap_pck
 from models import (
     TiptVitPoseForPoseEstimation,
-    TiptVitPoseV2ForPoseEstimation,
+    TiptVitPoseV3ForPoseEstimation,
+    TiptVitPoseV4ForPoseEstimation,
     shape_invariance_loss,
     weighted_heatmap_mse_loss,
 )
@@ -68,6 +69,7 @@ def make_dataset(cfg: dict[str, Any], split: str) -> CocoKeypointsTopDownDataset
         deterministic_obfuscation=prefix != "train",
         obfuscation_seed=int(data_cfg.get("obfuscation_seed", 0)),
         invariance_views=get_invariance_views_config(cfg, prefix),
+        crop_method=str(data_cfg.get("crop_method", "pil")),
     )
 
 
@@ -80,8 +82,8 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
 
         return VitPoseForPoseEstimation.from_pretrained(checkpoint)
 
-    if variant in {"tipt_v2", "tipt_v3", "tipt_shape_residual", "tipt_multilevel"}:
-        return TiptVitPoseV2ForPoseEstimation(
+    if variant in {"tipt_v2", "tipt_v3"}:
+        return TiptVitPoseV3ForPoseEstimation(
             checkpoint=checkpoint,
             structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
             stem_channels=int(model_cfg.get("stem_channels", 32)),
@@ -92,6 +94,25 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
             gate_init=float(model_cfg.get("gate_init", 0.1)),
             gate_hidden_ratio=float(model_cfg.get("gate_hidden_ratio", 0.25)),
             mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+        )
+
+    if variant in {"tiptv4", "tipt_v4"}:
+        return TiptVitPoseV4ForPoseEstimation(
+            checkpoint=checkpoint,
+            structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
+            stem_channels=int(model_cfg.get("stem_channels", 48)),
+            stem_depth=int(model_cfg.get("stem_depth", 3)),
+            shape_depth=int(model_cfg.get("shape_depth", 3)),
+            limb_depth=int(model_cfg.get("limb_depth", 2)),
+            keypoint_depth=int(model_cfg.get("keypoint_depth", 2)),
+            graph_depth=int(model_cfg.get("graph_depth", 2)),
+            shape_dropout=float(model_cfg.get("shape_dropout", 0.0)),
+            num_heads=model_cfg.get("num_heads"),
+            gate_init=float(model_cfg.get("gate_init", 0.1)),
+            pose_gate_init=float(model_cfg.get("pose_gate_init", 0.05)),
+            residual_heatmap_init=float(model_cfg.get("residual_heatmap_init", 0.05)),
+            mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+            num_keypoints=int(model_cfg.get("num_keypoints", 17)),
         )
 
     return TiptVitPoseForPoseEstimation(
@@ -109,14 +130,68 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
 def make_optimizer(model: torch.nn.Module, cfg: dict[str, Any]) -> torch.optim.Optimizer:
     train_cfg = cfg.get("training", {})
     weight_decay = float(train_cfg.get("weight_decay", 0.05))
+    scope = str(train_cfg.get("trainable", "all")).lower()
     if hasattr(model, "new_parameters") and hasattr(model, "pretrained_parameters"):
+        new_params = list(model.new_parameters())
+        pretrained_params = list(model.pretrained_parameters())
+        if scope not in {"all", "full"}:
+            new_params = [parameter for parameter in new_params if parameter.requires_grad]
+            pretrained_params = [parameter for parameter in pretrained_params if parameter.requires_grad]
         param_groups = [
-            {"params": list(model.new_parameters()), "lr": float(train_cfg.get("new_lr", 1e-4))},
-            {"params": list(model.pretrained_parameters()), "lr": float(train_cfg.get("pretrained_lr", 1e-5))},
+            {"params": new_params, "lr": float(train_cfg.get("new_lr", 1e-4))},
+            {"params": pretrained_params, "lr": float(train_cfg.get("pretrained_lr", 1e-5))},
         ]
+        param_groups = [group for group in param_groups if group["params"]]
+        if not param_groups:
+            raise ValueError("No trainable parameters found for optimizer.")
     else:
-        param_groups = [{"params": model.parameters(), "lr": float(train_cfg.get("pretrained_lr", 1e-5))}]
+        params = list(model.parameters()) if scope in {"all", "full"} else [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError("No trainable parameters found for optimizer.")
+        param_groups = [{"params": params, "lr": float(train_cfg.get("pretrained_lr", 1e-5))}]
     return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+
+def _resolve_module_attr(model: torch.nn.Module, name: str) -> torch.nn.Module:
+    module = getattr(model, name, None)
+    if module is None:
+        raise ValueError(f"Model {model.__class__.__name__} has no module named {name!r}.")
+    if not isinstance(module, torch.nn.Module):
+        raise ValueError(f"Attribute {name!r} on {model.__class__.__name__} is not a torch module.")
+    return module
+
+
+def apply_trainable_scope(model: torch.nn.Module, cfg: dict[str, Any]) -> str:
+    train_cfg = cfg.get("training", {})
+    scope = str(train_cfg.get("trainable", "all")).lower()
+    if scope in {"all", "full"}:
+        return "all"
+
+    if scope in {"head", "head_only", "decoder"}:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        for parameter in _resolve_module_attr(model, "head").parameters():
+            parameter.requires_grad = True
+        return "head"
+
+    if scope in {"new_plus_head", "shape_fusion_head", "tipt_fine_tuning"}:
+        if not hasattr(model, "new_parameters"):
+            raise ValueError(f"training.trainable={scope!r} requires a TIPT-style model with new_parameters().")
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        for parameter in model.new_parameters():
+            parameter.requires_grad = True
+        for parameter in _resolve_module_attr(model, "head").parameters():
+            parameter.requires_grad = True
+        return "new_plus_head"
+
+    raise ValueError(f"Unsupported training.trainable={scope!r}. Use 'all', 'head', or 'new_plus_head'.")
+
+
+def parameter_counts(model: torch.nn.Module) -> dict[str, int]:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    return {"total": total, "trainable": trainable}
 
 
 def resolve_device(value: str | None) -> torch.device:
@@ -278,6 +353,8 @@ def run_epoch(
                     pred_heatmaps,
                     batch,
                     input_size=loader.dataset.input_size,
+                    decode_method=cfg.get("eval", {}).get("decode", "hf"),
+                    dark_kernel_size=int(cfg.get("eval", {}).get("dark_kernel_size", 11)),
                 )
             )
 
@@ -354,9 +431,17 @@ def main() -> None:
     )
 
     model = make_model(cfg).to(device)
+    trainable_scope = apply_trainable_scope(model, cfg)
     freeze_epochs = int(train_cfg.get("freeze_pretrained_epochs", 0))
+    if trainable_scope != "all":
+        freeze_epochs = 0
     if hasattr(model, "set_pretrained_requires_grad") and freeze_epochs > 0:
         model.set_pretrained_requires_grad(False)
+    counts = parameter_counts(model)
+    print(
+        f"model_parameters={counts['total']} trainable_parameters={counts['trainable']} "
+        f"trainable_scope={trainable_scope}"
+    )
 
     optimizer = make_optimizer(model, cfg)
     output_root = Path(train_cfg.get("output_dir", "runs/tipt_vitpose"))

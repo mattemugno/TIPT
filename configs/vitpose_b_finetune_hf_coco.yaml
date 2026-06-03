@@ -1,15 +1,6 @@
 model:
   checkpoint: usyd-community/vitpose-base-simple
-  variant: tipt_v2
-  structural_channels: [sobel_x, sobel_y, magnitude]
-  stem_channels: 32
-  stem_depth: 3
-  shape_depth: 4
-  shape_dropout: 0.0
-  gate_init: 0.1
-  gate_hidden_ratio: 0.25
-  mlp_ratio: 4
-  num_heads:
+  variant: baseline
   dataset_index:
 
 data:
@@ -19,6 +10,7 @@ data:
   val_annotations: coco/annotations/person_keypoints_val2017.json
   input_size: [256, 192]
   heatmap_size: [64, 48]
+  crop_method: vitpose
   sigma: 2.0
   bbox_padding: 1.25
   skip_empty: true
@@ -27,8 +19,8 @@ data:
   obfuscation_seed: 0
   train_obfuscation:
     mode: random
-    modes: [none, blur, pixelate]
-    probability: 0.7
+    modes: [blur, pixelate]
+    probability: 1.0
     blur_kernel_size: [3, 17]
     pixel_size: [4, 12]
   val_obfuscation:
@@ -38,23 +30,27 @@ data:
 
 training:
   device: auto
-  output_dir: runs/tipt_vitpose_v2
-  run_name: tipt_v2_shape_residual
+  output_dir: runs/vitpose_b_finetune
+  run_name: vitpose_b_finetune_obfuscated
   summary_file: summary.json
   final_coco_eval: true
   epochs: 5
-  freeze_pretrained_epochs: 2
-  batch_size: 32
+  batch_size: 16
   eval_batch_size: 32
   num_workers: 4
-  new_lr: 0.0001
   pretrained_lr: 0.00001
   weight_decay: 0.05
   grad_clip_norm: 1.0
   log_every: 25
+  invariance:
+    enabled: false
+    mode: cosine
+    weight: 0.0
 
 eval:
   device: auto
   batch_size: 32
   num_workers: 4
   pck_threshold: 0.05
+  decode: hf
+  dark_kernel_size: 11

@@ -207,8 +207,8 @@ class ShapeTextureResidualBlock(nn.Module):
         return shape_tokens + self.gate(shape_tokens).to(dtype=attn_out.dtype) * attn_out
 
 
-class TiptVitPoseV2ForPoseEstimation(nn.Module):
-    """Shape-first TIPT-v2 with structural channels and multi-level residual fusion."""
+class TiptVitPoseV3ForPoseEstimation(nn.Module):
+    """Shape-first TIPT-v3 architecture with multi-level residual fusion."""
 
     def __init__(
         self,
@@ -228,7 +228,7 @@ class TiptVitPoseV2ForPoseEstimation(nn.Module):
             from transformers import VitPoseForPoseEstimation
         except ImportError as exc:
             raise ImportError(
-                "TiptVitPoseV2ForPoseEstimation requires transformers. "
+                "TiptVitPoseV3ForPoseEstimation requires transformers. "
                 "Install the project requirements before constructing the model."
             ) from exc
 
@@ -348,3 +348,6 @@ class TiptVitPoseV2ForPoseEstimation(nn.Module):
             hidden_states=getattr(backbone_outputs, "hidden_states", None),
             attentions=getattr(backbone_outputs, "attentions", None),
         )
+
+
+TiptVitPoseV2ForPoseEstimation = TiptVitPoseV3ForPoseEstimation

@@ -16,8 +16,10 @@ from .transforms import (
     crop_and_resize,
     generate_keypoint_heatmaps,
     keypoints_to_crop,
+    keypoints_to_vitpose_crop,
     normalize_image,
     to_hw,
+    vitpose_affine_crop_and_resize,
 )
 
 
@@ -61,6 +63,7 @@ class CocoKeypointsTopDownDataset(Dataset):
         deterministic_obfuscation: bool = False,
         obfuscation_seed: int = 0,
         invariance_views: dict[str, Any] | None = None,
+        crop_method: str = "pil",
     ) -> None:
         self.image_root = Path(image_root)
         self.annotation_file = Path(annotation_file)
@@ -74,6 +77,9 @@ class CocoKeypointsTopDownDataset(Dataset):
         self.deterministic_obfuscation = deterministic_obfuscation
         self.obfuscation_seed = obfuscation_seed
         self.invariance_views = invariance_views or {"enabled": False}
+        self.crop_method = crop_method
+        if self.crop_method not in {"pil", "vitpose"}:
+            raise ValueError(f"Unsupported crop_method {self.crop_method!r}; use 'pil' or 'vitpose'.")
 
         with self.annotation_file.open("r", encoding="utf-8") as handle:
             coco: dict[str, Any] = json.load(handle)
@@ -103,7 +109,15 @@ class CocoKeypointsTopDownDataset(Dataset):
         with Image.open(image_path) as image:
             image = image.convert("RGB")
             crop_box = aspect_ratio_box(ann["bbox"], self.input_size, padding=self.bbox_padding)
-            base_crop = crop_and_resize(image, crop_box, self.input_size)
+            if self.crop_method == "vitpose":
+                base_crop = vitpose_affine_crop_and_resize(
+                    image,
+                    ann["bbox"],
+                    self.input_size,
+                    padding=self.bbox_padding,
+                )
+            else:
+                base_crop = crop_and_resize(image, crop_box, self.input_size)
             if self.deterministic_obfuscation:
                 rng = random.Random(self.obfuscation_seed + index)
             else:
@@ -111,7 +125,15 @@ class CocoKeypointsTopDownDataset(Dataset):
             crop = apply_obfuscation(base_crop.copy(), self.obfuscation, rng=rng)
 
         raw_keypoints = np.asarray(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
-        keypoints_xy = keypoints_to_crop(raw_keypoints[:, :2], crop_box, self.input_size)
+        if self.crop_method == "vitpose":
+            keypoints_xy = keypoints_to_vitpose_crop(
+                raw_keypoints[:, :2],
+                ann["bbox"],
+                self.input_size,
+                padding=self.bbox_padding,
+            )
+        else:
+            keypoints_xy = keypoints_to_crop(raw_keypoints[:, :2], crop_box, self.input_size)
         visibility = raw_keypoints[:, 2].astype(np.float32)
         target_heatmaps, target_weights = generate_keypoint_heatmaps(
             keypoints_xy=keypoints_xy,

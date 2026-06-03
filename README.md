@@ -43,7 +43,20 @@ TIPT-v3 aggiunge training two-view e invarianza esplicita tra shape token blur/p
 python train.py --config configs/tipt_vitpose_v3_hf_coco.yaml
 ```
 
-Sweep blur baseline ViTPose-B vs TIPT-v3:
+Sweep clean/blur/pixelation baseline ViTPose-B vs TIPT-v3:
+
+```bash
+python scripts/eval_obfuscation_sweep.py \
+  --baseline-config configs/vitpose_b_baseline_hf_coco.yaml \
+  --blur-min-kernel 3 \
+  --blur-max-kernel 17 \
+  --pixel-sizes 4 6 8 10 12 16 \
+  --plot
+```
+
+Lo script salva metriche, predizioni, `summary.csv`, `summary.json` e, con `--plot`, i grafici in `runs/obfuscation_sweeps/<timestamp>/plots/`.
+
+Il vecchio comando resta valido se vuoi solo il blur:
 
 ```bash
 python scripts/eval_blur_sweep.py \
@@ -52,7 +65,24 @@ python scripts/eval_blur_sweep.py \
   --max-kernel 17
 ```
 
-Lo script salva metriche e predizioni in `runs/blur_sweeps/<timestamp>/`, più `summary.csv` e `summary.json`.
+Per generare o rigenerare grafici da una sweep gia' eseguita:
+
+```bash
+python scripts/plot_sweep.py runs/obfuscation_sweeps/<timestamp>/summary.json --metrics AP AP50 AP75
+```
+
+Sweep del peso della loss di invarianza shape:
+
+```bash
+python scripts/train_invariance_weight_sweep.py \
+  --weights 0.02 0.05 0.10 \
+  --blur-min-kernel 3 \
+  --blur-max-kernel 17 \
+  --pixel-sizes 4 6 8 10 12 16 \
+  --plot
+```
+
+Questo script crea config temporanei in `runs/invariance_weight_sweeps/<timestamp>/configs/`, addestra un checkpoint per ogni peso e poi valuta ogni checkpoint su clean, blur e pixelation.
 
 La configurazione di default fa warm-up congelando ViTPose per 2 epoch, poi sblocca backbone/head mantenendo due learning rate group:
 
@@ -73,6 +103,13 @@ Ogni run salva:
 RUN_DIR=$(cat runs/tipt_vitpose/latest_run.txt)
 python eval_coco.py --config configs/tipt_vitpose_hf_coco.yaml --checkpoint "$RUN_DIR/best.pt"
 ```
+
+L'evaluator usa di default il protocollo piu' vicino a ViTPose/Hugging Face:
+
+- `data.crop_method: vitpose` per crop affine top-down da bbox COCO;
+- `eval.decode: hf` per decoding DARK/unbiased delle heatmap.
+
+Per riprodurre vecchi risultati con argmax grezzo e crop PIL puoi usare `--decode simple` e `crop_method: pil`, ma i confronti baseline/TIPT vanno fatti tutti con lo stesso protocollo.
 
 Test senza creare dataset offuscati su disco:
 

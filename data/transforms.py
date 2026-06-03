@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 import random
 
 import numpy as np
@@ -52,6 +53,81 @@ def crop_and_resize(image: Image.Image, crop_xywh: Sequence[float], output_size:
     crop = image.crop((x, y, x + width, y + height))
     out_h, out_w = output_size
     return crop.resize((out_w, out_h), BILINEAR)
+
+
+@lru_cache(maxsize=1)
+def _vitpose_affine_ops():
+    try:
+        from scipy.ndimage import affine_transform
+        from transformers.models.vitpose.image_processing_pil_vitpose import box_to_center_and_scale, get_warp_matrix
+    except ImportError as exc:
+        raise ImportError("ViTPose affine crop requires transformers and scipy. Install requirements.txt first.") from exc
+    return affine_transform, box_to_center_and_scale, get_warp_matrix
+
+
+def _vitpose_center_scale(
+    bbox_xywh: Sequence[float],
+    output_size: tuple[int, int],
+    padding: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    _, box_to_center_and_scale, _ = _vitpose_affine_ops()
+    out_h, out_w = output_size
+    return box_to_center_and_scale(
+        np.asarray(bbox_xywh, dtype=np.float32),
+        image_width=out_w,
+        image_height=out_h,
+        padding_factor=padding,
+    )
+
+
+def _vitpose_warp_matrix(
+    bbox_xywh: Sequence[float],
+    output_size: tuple[int, int],
+    padding: float,
+) -> np.ndarray:
+    _, _, get_warp_matrix = _vitpose_affine_ops()
+    out_h, out_w = output_size
+    center, scale = _vitpose_center_scale(bbox_xywh, output_size, padding)
+    return get_warp_matrix(
+        0,
+        center * 2.0,
+        np.array([out_w, out_h], dtype=np.float32) - 1.0,
+        scale * 200.0,
+    )
+
+
+def _scipy_inverse_warp_matrix(matrix: np.ndarray) -> np.ndarray:
+    matrix_3x3 = np.vstack([matrix, [0, 0, 1]])
+    inverse = np.linalg.inv(matrix_3x3)
+    # Match the axis convention used by the HF PIL ViTPose backend.
+    inverse[0, 0], inverse[0, 1], inverse[1, 0], inverse[1, 1], inverse[0, 2], inverse[1, 2] = (
+        inverse[1, 1],
+        inverse[1, 0],
+        inverse[0, 1],
+        inverse[0, 0],
+        inverse[1, 2],
+        inverse[0, 2],
+    )
+    return inverse
+
+
+def vitpose_affine_crop_and_resize(
+    image: Image.Image,
+    bbox_xywh: Sequence[float],
+    output_size: tuple[int, int],
+    padding: float = 1.25,
+) -> Image.Image:
+    affine_transform, _, _ = _vitpose_affine_ops()
+    out_h, out_w = output_size
+    image_array = np.asarray(image)
+    inverse = _scipy_inverse_warp_matrix(_vitpose_warp_matrix(bbox_xywh, output_size, padding))
+    channels = [
+        affine_transform(image_array[..., channel], inverse, output_shape=(out_h, out_w), order=1)
+        for channel in range(image_array.shape[-1])
+    ]
+    crop = np.stack(channels, axis=-1)
+    crop = np.clip(crop, 0, 255).astype(np.uint8)
+    return Image.fromarray(crop)
 
 
 def _sample_range(value: float | int | Sequence[float | int], rng: random.Random) -> float:
@@ -150,6 +226,18 @@ def keypoints_to_crop(
     transformed[:, 0] = (transformed[:, 0] - x) * (out_w / width)
     transformed[:, 1] = (transformed[:, 1] - y) * (out_h / height)
     return transformed
+
+
+def keypoints_to_vitpose_crop(
+    keypoints_xy: np.ndarray,
+    bbox_xywh: Sequence[float],
+    output_size: tuple[int, int],
+    padding: float = 1.25,
+) -> np.ndarray:
+    matrix = _vitpose_warp_matrix(bbox_xywh, output_size, padding)
+    points = keypoints_xy.astype(np.float32)
+    homogeneous = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+    return homogeneous @ matrix.T
 
 
 def normalize_image(

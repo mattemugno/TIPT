@@ -13,7 +13,12 @@ import yaml
 from coco_metrics import batch_to_coco_keypoint_results, evaluate_coco_keypoints
 from data import CocoKeypointsTopDownDataset
 from data.transforms import heatmap_pck
-from models import TiptVitPoseForPoseEstimation, TiptVitPoseV2ForPoseEstimation, weighted_heatmap_mse_loss
+from models import (
+    TiptVitPoseForPoseEstimation,
+    TiptVitPoseV3ForPoseEstimation,
+    TiptVitPoseV4ForPoseEstimation,
+    weighted_heatmap_mse_loss,
+)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -59,8 +64,8 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
         from transformers import VitPoseForPoseEstimation
 
         return VitPoseForPoseEstimation.from_pretrained(checkpoint)
-    if model_cfg.get("variant") in {"tipt_v2", "tipt_v3", "tipt_shape_residual", "tipt_multilevel"}:
-        return TiptVitPoseV2ForPoseEstimation(
+    if model_cfg.get("variant") in {"tipt_v2", "tipt_v3"}:
+        return TiptVitPoseV3ForPoseEstimation(
             checkpoint=checkpoint,
             structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
             stem_channels=int(model_cfg.get("stem_channels", 32)),
@@ -71,6 +76,24 @@ def make_model(cfg: dict[str, Any]) -> torch.nn.Module:
             gate_init=float(model_cfg.get("gate_init", 0.1)),
             gate_hidden_ratio=float(model_cfg.get("gate_hidden_ratio", 0.25)),
             mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+        )
+    if model_cfg.get("variant") in {"tiptv4", "tipt_v4"}:
+        return TiptVitPoseV4ForPoseEstimation(
+            checkpoint=checkpoint,
+            structural_channels=tuple(model_cfg.get("structural_channels", ["sobel_x", "sobel_y", "magnitude"])),
+            stem_channels=int(model_cfg.get("stem_channels", 48)),
+            stem_depth=int(model_cfg.get("stem_depth", 3)),
+            shape_depth=int(model_cfg.get("shape_depth", 3)),
+            limb_depth=int(model_cfg.get("limb_depth", 2)),
+            keypoint_depth=int(model_cfg.get("keypoint_depth", 2)),
+            graph_depth=int(model_cfg.get("graph_depth", 2)),
+            shape_dropout=float(model_cfg.get("shape_dropout", 0.0)),
+            num_heads=model_cfg.get("num_heads"),
+            gate_init=float(model_cfg.get("gate_init", 0.1)),
+            pose_gate_init=float(model_cfg.get("pose_gate_init", 0.05)),
+            residual_heatmap_init=float(model_cfg.get("residual_heatmap_init", 0.05)),
+            mlp_ratio=int(model_cfg.get("mlp_ratio", 4)),
+            num_keypoints=int(model_cfg.get("num_keypoints", 17)),
         )
     return TiptVitPoseForPoseEstimation(
         checkpoint=checkpoint,
@@ -97,19 +120,27 @@ def resolve_device(value: str | None) -> torch.device:
     return torch.device(value)
 
 
-def save_metrics(path: str | Path, metrics: dict[str, float], cfg: dict[str, Any], obfuscation: dict[str, Any]) -> None:
+def save_metrics(
+    path: str | Path,
+    metrics: dict[str, float],
+    cfg: dict[str, Any],
+    obfuscation: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+    evaluation: dict[str, Any] | None = None,
+) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metrics": metrics,
+        "obfuscation": obfuscation,
+        "config": cfg,
+    }
+    if metadata is not None:
+        payload["model_metadata"] = metadata
+    if evaluation is not None:
+        payload["evaluation"] = evaluation
     with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "metrics": metrics,
-                "obfuscation": obfuscation,
-                "config": cfg,
-            },
-            handle,
-            indent=2,
-        )
+        json.dump(payload, handle, indent=2)
 
 
 def model_metadata(model: torch.nn.Module, checkpoint: str | None) -> dict[str, Any]:
@@ -145,6 +176,8 @@ def main() -> None:
     parser.add_argument("--obfuscation", choices=["none", "blur", "pixelate", "random"])
     parser.add_argument("--blur-kernel-size", type=int)
     parser.add_argument("--pixel-size", type=int)
+    parser.add_argument("--decode", choices=["hf", "simple"], help="Heatmap decoding for COCO results.")
+    parser.add_argument("--dark-kernel-size", type=int)
     parser.add_argument("--no-coco", action="store_true")
     parser.add_argument("--results-json", default="runs/eval_coco_keypoints.json")
     parser.add_argument("--metrics-json")
@@ -154,6 +187,9 @@ def main() -> None:
     device = resolve_device(cfg.get("eval", {}).get("device", cfg.get("training", {}).get("device", "auto")))
     data_cfg = cfg["data"]
     eval_cfg = cfg.get("eval", {})
+    decode_method = args.decode or eval_cfg.get("decode", "hf")
+    dark_kernel_size = int(args.dark_kernel_size if args.dark_kernel_size is not None else eval_cfg.get("dark_kernel_size", 11))
+    crop_method = str(data_cfg.get("crop_method", "pil"))
     obfuscation = get_obfuscation_config(
         cfg,
         mode_override=args.obfuscation,
@@ -172,6 +208,7 @@ def main() -> None:
         obfuscation=obfuscation,
         deterministic_obfuscation=True,
         obfuscation_seed=int(data_cfg.get("obfuscation_seed", 0)),
+        crop_method=crop_method,
     )
     loader = DataLoader(
         dataset,
@@ -215,6 +252,8 @@ def main() -> None:
                         pred_heatmaps,
                         batch,
                         input_size=dataset.input_size,
+                        decode_method=decode_method,
+                        dark_kernel_size=dark_kernel_size,
                     )
                 )
 
@@ -226,12 +265,18 @@ def main() -> None:
     if not args.no_coco:
         print(f"coco_AP={metrics['AP']:.4f} AP50={metrics['AP50']:.4f} AP75={metrics['AP75']:.4f}")
     if args.metrics_json:
-        save_metrics(args.metrics_json, metrics, cfg, obfuscation)
-        with Path(args.metrics_json).open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        payload["model_metadata"] = metadata
-        with Path(args.metrics_json).open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        save_metrics(
+            args.metrics_json,
+            metrics,
+            cfg,
+            obfuscation,
+            metadata=metadata,
+            evaluation={
+                "crop_method": crop_method,
+                "decode": decode_method,
+                "dark_kernel_size": dark_kernel_size,
+            },
+        )
 
 
 if __name__ == "__main__":

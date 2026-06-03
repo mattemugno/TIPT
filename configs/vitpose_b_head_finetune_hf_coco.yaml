@@ -17,10 +17,36 @@ data:
   train_max_samples:
   val_max_samples:
   obfuscation_seed: 0
+  train_obfuscation:
+    mode: random
+    modes: [blur, pixelate]
+    probability: 1.0
+    blur_kernel_size: [3, 17]
+    pixel_size: [4, 12]
   val_obfuscation:
-    mode: none
+    mode: blur
     blur_kernel_size: 11
     pixel_size: 8
+
+training:
+  device: auto
+  output_dir: runs/vitpose_b_head_finetune
+  run_name: vitpose_b_head_finetune_obfuscated
+  summary_file: summary.json
+  final_coco_eval: true
+  trainable: head
+  epochs: 5
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 4
+  pretrained_lr: 0.0001
+  weight_decay: 0.05
+  grad_clip_norm: 1.0
+  log_every: 25
+  invariance:
+    enabled: false
+    mode: cosine
+    weight: 0.0
 
 eval:
   device: auto

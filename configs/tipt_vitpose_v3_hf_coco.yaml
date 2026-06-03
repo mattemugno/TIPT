@@ -19,6 +19,7 @@ data:
   val_annotations: coco/annotations/person_keypoints_val2017.json
   input_size: [256, 192]
   heatmap_size: [64, 48]
+  crop_method: vitpose
   sigma: 2.0
   bbox_padding: 1.25
   skip_empty: true
@@ -68,3 +69,5 @@ eval:
   batch_size: 16
   num_workers: 4
   pck_threshold: 0.05
+  decode: hf
+  dark_kernel_size: 11

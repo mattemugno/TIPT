@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -19,6 +21,17 @@ COCO_KEYPOINT_METRIC_NAMES = (
     "ARM",
     "ARL",
 )
+
+
+@lru_cache(maxsize=4)
+def _vitpose_image_processor(input_size: tuple[int, int]):
+    try:
+        from transformers import VitPoseImageProcessor
+    except ImportError as exc:
+        raise ImportError("HF ViTPose decoding requires transformers. Install requirements.txt first.") from exc
+
+    input_h, input_w = input_size
+    return VitPoseImageProcessor(size={"height": input_h, "width": input_w})
 
 
 def heatmaps_to_image_keypoints(
@@ -58,7 +71,19 @@ def batch_to_coco_keypoint_results(
     heatmaps: torch.Tensor,
     batch: dict[str, Any],
     input_size: tuple[int, int],
+    decode_method: str = "hf",
+    dark_kernel_size: int = 11,
 ) -> list[dict[str, Any]]:
+    if decode_method == "hf":
+        return batch_to_coco_keypoint_results_hf(
+            heatmaps,
+            batch,
+            input_size=input_size,
+            dark_kernel_size=dark_kernel_size,
+        )
+    if decode_method != "simple":
+        raise ValueError(f"Unsupported decode_method {decode_method!r}; use 'hf' or 'simple'.")
+
     keypoints_xy, keypoint_scores = heatmaps_to_image_keypoints(
         heatmaps.detach().float().cpu(),
         batch["crop_box"].detach().float().cpu(),
@@ -80,6 +105,50 @@ def batch_to_coco_keypoint_results(
                 "category_id": 1,
                 "keypoints": coco_keypoints,
                 "score": mean_score,
+                "bbox": [float(value) for value in bboxes[idx].tolist()],
+            }
+        )
+    return results
+
+
+def batch_to_coco_keypoint_results_hf(
+    heatmaps: torch.Tensor,
+    batch: dict[str, Any],
+    input_size: tuple[int, int],
+    dark_kernel_size: int = 11,
+) -> list[dict[str, Any]]:
+    """Decode heatmaps with the Hugging Face ViTPose DARK/unbiased post-processing."""
+
+    processor = _vitpose_image_processor(input_size)
+    bboxes = batch["bbox"].detach().float().cpu()
+    boxes = [[bbox.tolist()] for bbox in bboxes]
+    outputs = SimpleNamespace(heatmaps=heatmaps.detach().float().cpu())
+    try:
+        pose_batches = processor.post_process_pose_estimation(
+            outputs,
+            boxes=boxes,
+            kernel_size=dark_kernel_size,
+        )
+    except NameError as exc:
+        raise ImportError("HF ViTPose DARK decoding requires scipy. Install requirements.txt first.") from exc
+    image_ids = batch["image_id"].detach().cpu().tolist()
+
+    results = []
+    for idx, image_id in enumerate(image_ids):
+        pose = pose_batches[idx][0]
+        keypoints_xy = pose["keypoints"].detach().float().cpu()
+        keypoint_scores = pose["scores"].detach().float().cpu()
+
+        coco_keypoints: list[float] = []
+        for point, score in zip(keypoints_xy, keypoint_scores, strict=True):
+            coco_keypoints.extend([float(point[0]), float(point[1]), float(score)])
+
+        results.append(
+            {
+                "image_id": int(image_id),
+                "category_id": 1,
+                "keypoints": coco_keypoints,
+                "score": float(keypoint_scores.mean()),
                 "bbox": [float(value) for value in bboxes[idx].tolist()],
             }
         )
